@@ -26,10 +26,26 @@ void cuda_kernel(float *freq_data, float *stream_data, int freq_size, int stream
 
 int main(int argc, char** argv) {
   int device_id = 0;
-  // 128 * 4 MB 
-  const int data_size = 1024 * 1024 * 1024 / sizeof(float);
-  const int freq_size = 1024 * 1024 * 10 / sizeof(float);
-  const int stream_size = data_size - freq_size;
+  int data_size = 1024 * 1024 * 1024 / sizeof(float);
+  int freq_size = 1024 * 1024 * 10 / sizeof(float);
+  int stream_size = data_size - freq_size;
+  int runs = 100;
+  if(argc < 3){
+    // printf("Usage: %s data_size(MB) freq_size(MB)\n", argv[0]);
+    // exit(1);
+    runs = 2;
+  } else {
+    data_size = atoi(argv[1]) * 1024 * 1024 / sizeof(float);
+    freq_size = atoi(argv[2]) * 1024 * 1024 / sizeof(float);
+    stream_size = data_size - freq_size;
+    if(argc == 4) {
+      runs = atoi(argv[3]);
+    }
+  }
+  int warmup = 5;
+  if(warmup >= runs) {
+    warmup = runs - 1;
+  }
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -44,7 +60,7 @@ int main(int argc, char** argv) {
   cout << "l2 cache size: " << prop.l2CacheSize << endl;
   cout << "max persisting cache size: " << prop.persistingL2CacheMaxSize << " Byte"<< endl;
   cout << "set persisting cache size: " << freq_size * sizeof(float) << " Byte"<< endl;
-  cudaDeviceSetLimit( cudaLimitPersistingL2CacheSize, freq_size * sizeof(float));                                  // set-aside 3/4 of L2 cache for persisting accesses or the max allowed
+  cudaDeviceSetLimit( cudaLimitPersistingL2CacheSize, min(freq_size * sizeof(float), static_cast<size_t>(prop.persistingL2CacheMaxSize)));   // set-aside 3/4 of L2 cache for persisting accesses or the max allowed
 
   float* h_data = (float *)malloc(data_size * sizeof(float));
   float* data;
@@ -59,7 +75,7 @@ int main(int argc, char** argv) {
  #ifdef ENABLE_PERSIST 
   cudaStreamAttrValue stream_attribute;
   stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(data);              // Global Memory data pointer
-  stream_attribute.accessPolicyWindow.num_bytes = min((long)(freq_size * sizeof(float)), (long)(prop.accessPolicyMaxWindowSize));                  // Number of bytes for persistence access
+  stream_attribute.accessPolicyWindow.num_bytes = min((long)(freq_size * sizeof(float)), (long)(prop.persistingL2CacheMaxSize));                  // Number of bytes for persistence access
   stream_attribute.accessPolicyWindow.hitRatio  = 1.0;                                        // Hint for cache hit ratio
   stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;               // Persistence Property
   stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;                // Type of access property on cache miss
@@ -69,22 +85,46 @@ int main(int argc, char** argv) {
   
   cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);   // Set the attributes to a CUDA Stream
 #endif
-  float accum = 0;
-  for(int i = 0; i < 100; i++) {
-    cudaEventRecord(start);
-    
-    cuda_kernel <<<block_num, block_size, 0, stream>>> (data, data + freq_size, freq_size, stream_size); // This data1 is used by a kernel multiple times
-    cudaEventRecord(stop);
-    // copy results
-    cudaMemcpy(h_data, data, data_size * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    accum += milliseconds;
+  {
+    float accum = 0;
+    for(int i = 0; i < runs; i++) {
+      cudaEventRecord(start);
+      
+      cuda_kernel <<<block_num, block_size, 0, stream>>> (data, data + freq_size, freq_size, stream_size); // This data1 is used by a kernel multiple times
+      cudaEventRecord(stop);
+      // copy results
+      cudaMemcpy(h_data, data, data_size * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaEventSynchronize(stop);
+      float milliseconds = 0;
+      cudaEventElapsedTime(&milliseconds, start, stop);
+      accum += milliseconds;
+      if(i >= warmup){
+        accum += milliseconds;
+      }
+    }
+    cout << "Time: " << fixed << setprecision(6) << accum / (runs - warmup) << " ms" << endl;
+    cudaStreamDestroy(stream);
+    cudaCtxResetPersistingL2Cache();
   }
-  cout << "Time: " << fixed << setprecision(6) << accum / 100 << " ms" << endl;
-
-  cudaCtxResetPersistingL2Cache();
+  {
+    float accum = 0;
+    for(int i = 0; i < runs; i++) {
+      cudaEventRecord(start);
+      
+      cuda_kernel <<<block_num, block_size>>> (data, data + freq_size, freq_size, stream_size); // This data1 is used by a kernel multiple times
+      cudaEventRecord(stop);
+      // copy results
+      cudaMemcpy(h_data, data, data_size * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaEventSynchronize(stop);
+      float milliseconds = 0;
+      cudaEventElapsedTime(&milliseconds, start, stop);
+      accum += milliseconds;
+      if(i >= warmup){
+        accum += milliseconds;
+      }
+    }
+    cout << "Time: " << fixed << setprecision(6) << accum / (runs - warmup) << " ms" << endl;
+  }
 }
 
 
